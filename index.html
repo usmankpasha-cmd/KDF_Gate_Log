@@ -367,6 +367,10 @@ body.ur .ff-radio label{font-family:var(--font-ur);font-size:14px}
     </div>
   </header>
 
+  <div class="offline-banner" id="offline-banner">
+    <div class="offline-banner-dot"></div>
+    <span id="offline-banner-text">Offline — entries saved locally, will sync when connected</span>
+  </div>
   <main>
     <div class="stats-row">
       <div class="stat-card"><div class="stat-label"><span class="en-text">Today IN</span><span class="ur-text">آج داخل</span></div><div class="stat-num cg" id="s-in">—</div></div>
@@ -894,9 +898,15 @@ function initFirebase(cfg){
     onValue(entriesRef, snap=>{
       entries = {};
       snap.forEach(c=>{ entries[c.key]={...c.val(),_key:c.key}; });
+      // Re-add any still-pending queued entries so they show while waiting to sync
+      loadQueue().forEach(e=>{ if(e._queued) entries[e._queueId]={...e,_key:e._queueId}; });
       setSyncDot(true);
+      isOnline = true;
+      updateOfflineUI();
       if(currentUser) render();
-    }, ()=>setSyncDot(false));
+      // Attempt to drain queue on every fresh data load
+      syncQueue();
+    }, ()=>{ setSyncDot(false); isOnline=false; updateOfflineUI(); });
 
     // listen to users
     onValue(usersRef, snap=>{
@@ -961,6 +971,8 @@ function showApp(){
   document.getElementById('actions-th').style.display    = canDelete()?'':'none';
   setLang(lang);
   render();
+  updateOfflineUI();
+  syncQueue();
 }
 
 window.doLogin = function(){
@@ -1081,7 +1093,7 @@ window.render = function(){
     const k = e._key||e.id;
     const locBadge = e.location ? `<span class="badge" style="background:#e5e1d8;color:#444">${e.location}</span>` : '—';
     return `<tr>
-      <td class="td-mono">${e.id}</td>
+      <td class="td-mono">${e.id}${e._queued?'<span style="font-size:9px;color:#f6c90e;margin-left:3px" title="Pending sync">⏸</span>':''}</td>
       <td style="white-space:nowrap;font-size:12px;color:var(--text2)">${dtStr}</td>
       <td>${locBadge}</td>
       <td><span class="badge ${e.direction==='IN'?'b-in':'b-out'}">
@@ -1244,9 +1256,31 @@ window.saveEntry = async function(){
     localStorage.setItem(DEMO_KEY, JSON.stringify(demoEntries));
     render(); return;
   }
+  if(!isOnline){
+    // OFFLINE: save to local queue with original timestamp preserved
+    entry._queueId = 'q-'+Date.now()+'-'+Math.random().toString(36).slice(2,7);
+    entry._queued  = true;
+    enqueueEntry(entry);
+    // Also add to local entries map so it shows immediately in the table
+    const tempKey = entry._queueId;
+    entries[tempKey] = {...entry, _key:tempKey};
+    render();
+    return;
+  }
+  // ONLINE: push directly to Firebase
   setSyncDot(false);
-  await push(entriesRef, entry);
-  setSyncDot(true);
+  try{
+    await push(entriesRef, entry);
+    setSyncDot(true);
+  } catch(e){
+    // Firebase push failed — fall back to queue
+    entry._queueId = 'q-err-'+Date.now();
+    entry._queued  = true;
+    enqueueEntry(entry);
+    const tempKey = entry._queueId;
+    entries[tempKey] = {...entry, _key:tempKey};
+    render();
+  }
 };
 
 // ── DELETE (admin only) ───────────────────────────────────────────────────────
@@ -1793,6 +1827,92 @@ window.doChangePassword = async function(){
   if(typeof toast==='function') toast('Password changed successfully!','ok');
   else alert('Password changed!');
 };
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OFFLINE QUEUE — entries saved locally when offline, auto-synced when back
+// Timestamps are ALWAYS the moment the guard pressed Save, never sync time
+// ══════════════════════════════════════════════════════════════════════════════
+const QUEUE_KEY = 'farmgate-offline-queue-v1';
+let isOnline = navigator.onLine;
+let isSyncing = false;
+
+// Load queue from localStorage
+function loadQueue(){
+  try{ return JSON.parse(localStorage.getItem(QUEUE_KEY)||'[]'); }
+  catch(e){ return []; }
+}
+function saveQueue(q){ localStorage.setItem(QUEUE_KEY, JSON.stringify(q)); }
+function queueSize(){ return loadQueue().length; }
+
+// Add an entry to the offline queue
+function enqueueEntry(entry){
+  const q = loadQueue();
+  q.push(entry);
+  saveQueue(q);
+  updateOfflineUI();
+}
+
+// Remove a successfully synced entry from queue
+function dequeueEntry(queueId){
+  const q = loadQueue().filter(e=>e._queueId!==queueId);
+  saveQueue(q);
+  updateOfflineUI();
+}
+
+// Update banner + sync badge to reflect offline/queue state
+function updateOfflineUI(){
+  const banner = document.getElementById('offline-banner');
+  const bannerText = document.getElementById('offline-banner-text');
+  const q = loadQueue();
+  const qLen = q.length;
+  const isUR = lang==='ur';
+
+  if(!isOnline){
+    if(banner){ banner.classList.add('show'); }
+    if(bannerText) bannerText.textContent = isUR
+      ? `آف لائن — ${qLen} اندراج محفوظ، انٹرنیٹ آنے پر خودبخود ہم آہنگ ہوگا`
+      : `Offline — ${qLen} entr${qLen===1?'y':'ies'} saved locally, will sync when connected`;
+    setSyncDot(false);
+    const sb = document.getElementById('sync-badge');
+    if(sb){ sb.className='sync-badge queued'; sb.textContent = isUR ? `⏸ آف لائن ${qLen>0?'('+qLen+')':''}` : `⏸ Offline${qLen>0?' ('+qLen+')':''}`; }
+  } else if(qLen>0){
+    if(banner){ banner.classList.add('show'); }
+    if(bannerText) bannerText.textContent = isUR
+      ? `${qLen} اندراج ہم آہنگ ہو رہے ہیں...`
+      : `Syncing ${qLen} pending entr${qLen===1?'y':'ies'}...`;
+  } else {
+    if(banner){ banner.classList.remove('show'); }
+  }
+}
+
+// Drain the queue to Firebase when online
+async function syncQueue(){
+  if(!isOnline || demoMode || isSyncing) return;
+  const q = loadQueue();
+  if(!q.length) return;
+  isSyncing = true;
+  const sb = document.getElementById('sync-badge');
+  if(sb){ sb.className='sync-badge syncing'; sb.textContent='↑ Syncing…'; }
+  let synced = 0;
+  for(const entry of q){
+    try{
+      const { _queueId, ...firebaseEntry } = entry; // strip queue metadata
+      await push(entriesRef, firebaseEntry);
+      dequeueEntry(_queueId);
+      synced++;
+    } catch(e){
+      console.error('Sync failed for entry', entry._queueId, e);
+      break; // stop if Firebase errors — try again on next reconnect
+    }
+  }
+  isSyncing = false;
+  updateOfflineUI();
+  if(synced>0 && typeof render==='function') render();
+}
+
+// Listen for online/offline events
+window.addEventListener('online',  ()=>{ isOnline=true;  updateOfflineUI(); syncQueue(); });
+window.addEventListener('offline', ()=>{ isOnline=false; updateOfflineUI(); });
 
 // ── BOOT ─────────────────────────────────────────────────────────────────────
 // ★ HARDCODED FIREBASE CONFIG — all users connect automatically, no setup needed
